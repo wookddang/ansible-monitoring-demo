@@ -1,0 +1,195 @@
+- hosts: app
+  become: true
+  vars:
+    app_dir: /opt/demoapp
+    version: "{{ version | default('v1') }}"
+    target_color: "{{ target_color | default('green') }}"  # green|blue
+    port_map:
+      blue: 5001
+      green: 5002
+
+  tasks:
+    - name: Ensure base pkgs
+      ansible.builtin.package:
+        name:
+          - python3
+          - python3-pip
+          - firewalld
+        state: present
+
+    - name: Ensure firewalld running
+      ansible.builtin.service:
+        name: firewalld
+        state: started
+        enabled: yes
+
+    - name: Open app ports (blue/green)
+      ansible.posix.firewalld:
+        port: "{{ item }}/tcp"
+        permanent: true
+        immediate: true
+        state: enabled
+      loop:
+        - "{{ port_map.blue }}"
+        - "{{ port_map.green }}"
+
+    - name: Create release dir
+      ansible.builtin.file:
+        path: "{{ app_dir }}/releases/{{ version }}"
+        state: directory
+        mode: "0755"
+
+    - name: Place demo Flask app
+      ansible.builtin.copy:
+        dest: "{{ app_dir }}/releases/{{ version }}/app.py"
+        mode: "0644"
+        content: |
+          from flask import Flask
+          app = Flask(__name__)
+          @app.get('/healthz')
+          def h(): return 'ok', 200
+          @app.get('/')
+          def i(): return 'Hello {{ version }}'
+          if __name__ == '__main__':
+            import os; app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5001)))
+
+    - name: Install Flask
+      ansible.builtin.pip:
+        name: flask
+        executable: pip3
+
+    - name: Ensure color symlink for target points to this release
+      ansible.builtin.file:
+        src: "{{ app_dir }}/releases/{{ version }}"
+        dest: "{{ app_dir }}/current-{{ target_color }}"
+        state: link
+        force: true
+
+    - name: Create systemd units for both colors
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/demoapp-{{ item.key }}.service"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=DemoApp {{ item.key }}
+          After=network.target
+
+          [Service]
+          WorkingDirectory={{ app_dir }}/current-{{ item.key }}
+          Environment=PORT={{ item.value }}
+          ExecStart=/usr/bin/python3 {{ app_dir }}/current-{{ item.key }}/app.py
+          Restart=always
+          User=root
+
+          [Install]
+          WantedBy=multi-user.target
+      loop: "{{ port_map | dict2items }}"
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: Start target color service
+      ansible.builtin.service:
+        name: "demoapp-{{ target_color }}"
+        state: restarted
+        enabled: yes
+
+    - name: Backend health check (target color, on app host)
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ port_map[target_color] }}/healthz"
+        status_code: 200
+        validate_certs: no
+      register: app_hc
+
+    - name: Show backend health
+      ansible.builtin.debug:
+        var: app_hc.status
+
+- hosts: web
+  become: true
+  vars:
+    upstream_file: /etc/nginx/conf.d/upstream-demo.conf
+    target_color: "{{ target_color | default('green') }}"
+    prev_color: "{{ 'blue' if target_color == 'green' else 'green' }}"
+    port_map:
+      blue: 5001
+      green: 5002
+    app_host: "{{ hostvars[groups['app'][0]].ansible_host | default(groups['app'][0]) }}"
+    alertmanager_url: "http://{{ hostvars[groups['mon'][0]].ansible_host | default(groups['mon'][0]) }}:9093/api/v2/alerts"
+
+  tasks:
+    - name: Ensure nginx
+      ansible.builtin.package:
+        name: nginx
+        state: present
+
+    # 웹 노드에서 한번 더 백엔드 헬스 검사(네트워크 경로 검증)
+    - name: Precheck backend from web node
+      ansible.builtin.uri:
+        url: "http://{{ app_host }}:{{ port_map[target_color] }}/healthz"
+        status_code: 200
+        validate_certs: no
+      register: pre_hc
+
+    - name: Switch Nginx to target color with rollback on failure
+      block:
+        - name: Configure nginx upstream → target color
+          ansible.builtin.copy:
+            dest: "{{ upstream_file }}"
+            mode: "0644"
+            content: |
+              upstream demo_upstream { server {{ app_host }}:{{ port_map[target_color] }}; }
+              server {
+                listen 80 default_server;
+                location / { proxy_pass http://demo_upstream; proxy_set_header Host $host; }
+                location /healthz { return 200 'ok'; }
+              }
+          notify: Reload nginx
+
+        - name: Ensure nginx running
+          ansible.builtin.service:
+            name: nginx
+            state: started
+            enabled: yes
+
+        - name: Verify front after switch (HTTP 200)
+          ansible.builtin.uri:
+            url: "http://127.0.0.1/healthz"
+            status_code: 200
+            validate_certs: no
+
+      rescue:
+        - name: Rollback nginx to previous color
+          ansible.builtin.copy:
+            dest: "{{ upstream_file }}"
+            mode: "0644"
+            content: |
+              upstream demo_upstream { server {{ app_host }}:{{ port_map[prev_color] }}; }
+              server {
+                listen 80 default_server;
+                location / { proxy_pass http://demo_upstream; proxy_set_header Host $host; }
+                location /healthz { return 200 'ok'; }
+              }
+          notify: Reload nginx
+
+        - name: Send alert to Alertmanager (switch failed, rolled back)
+          ansible.builtin.uri:
+            url: "{{ alertmanager_url }}"
+            method: POST
+            body_format: json
+            body:
+              - labels:
+                  alertname: "BlueGreenSwitchFailed"
+                  service: "demoapp"
+                  severity: "critical"
+                  target_color: "{{ target_color }}"
+                annotations:
+                  summary: "Nginx switch to {{ target_color }} failed; rolled back to {{ prev_color }}"
+                  description: "Front path check failed on web host"
+            status_code: 200
+          ignore_errors: true
+
+  handlers:
+    - name: Reload nginx
+      ansible.builtin.command: nginx -s reload

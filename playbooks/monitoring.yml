@@ -1,0 +1,63 @@
+- hosts: all
+  become: true
+  pre_tasks:
+    - package: { name: epel-release, state: present }
+    - package: { name: dnf-plugins-core, state: present }
+    - command: dnf config-manager --set-enabled crb
+      changed_when: false
+      failed_when: false
+
+  tasks:
+    - name: Install node exporter (try multiple names)
+      block:
+        - package: { name: prometheus2-node-exporter, state: present }
+      rescue:
+        - block:
+            - package: { name: prometheus-node-exporter, state: present }
+          rescue:
+            - package: { name: node_exporter, state: present }
+
+    - name: Ensure node_exporter service enabled
+      # 일부 배포는 서비스명이 node_exporter로 고정
+      service:
+        name: node_exporter
+        state: started
+        enabled: yes
+      failed_when: false
+
+- hosts: mon
+  become: true
+  vars:
+    prometheus_conf: /etc/prometheus/prometheus.yml
+  tasks:
+    - name: Install Prometheus + Alertmanager (try v2 then legacy)
+      block:
+        - package:
+            name: [ prometheus2, prometheus2-alertmanager ]
+            state: present
+      rescue:
+        - package:
+            name: [ prometheus, alertmanager ]
+            state: present
+
+    - name: Deploy Prometheus config
+      template:
+        src: templates/prometheus.yml.j2
+        dest: "{{ prometheus_conf }}"
+        mode: '0644'
+
+    - name: Enable and start Prometheus (try common service names)
+      shell: |
+        systemctl daemon-reload
+        (systemctl enable --now prometheus 2>/dev/null) \
+        || (systemctl enable --now prometheus2 2>/dev/null) \
+        || true
+      args: { warn: false }
+
+    - name: Enable and start Alertmanager (try common service names)
+      shell: |
+        (systemctl enable --now alertmanager 2>/dev/null) \
+        || (systemctl enable --now prometheus-alertmanager 2>/dev/null) \
+        || (systemctl enable --now prometheus2-alertmanager 2>/dev/null) \
+        || true
+      args: { warn: false }

@@ -1,0 +1,43 @@
+- hosts: all
+  become: true
+  tasks:
+    - name: Backup main config
+      copy:
+        src: /etc/ssh/sshd_config
+        dest: "/etc/ssh/sshd_config.bak.{{ ansible_date_time.iso8601 }}"
+        remote_src: true
+
+    - name: Remove duplicates in main file
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item }}"
+        state: absent
+      loop:
+        - '^[[:space:]]*PasswordAuthentication[[:space:]]+.*'
+        - '^[[:space:]]*PermitRootLogin[[:space:]]+.*'
+
+    - name: Remove conflicting lines in drop-in files (if any)
+      lineinfile:
+        path: "{{ item }}"
+        regexp: '^[[:space:]]*(PasswordAuthentication|PermitRootLogin)[[:space:]]+.*'
+        state: absent
+      with_fileglob:
+        - "/etc/ssh/sshd_config.d/*.conf"
+      ignore_errors: true
+
+    - name: Append canonical policy at end of main file
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} ANSIBLE SSH POLICY"
+        block: |
+          PasswordAuthentication no
+          PermitRootLogin prohibit-password
+          PubkeyAuthentication yes
+          AuthorizedKeysFile .ssh/authorized_keys
+          Subsystem sftp /usr/libexec/openssh/sftp-server
+
+    - name: Validate config
+      command: sshd -t -f /etc/ssh/sshd_config
+
+    - name: Restart sshd
+      service: { name: sshd, state: restarted }

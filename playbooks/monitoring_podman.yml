@@ -1,0 +1,157 @@
+- hosts: all
+  become: true
+
+  pre_tasks:
+    - name: Enable EPEL & dnf plugins
+      ansible.builtin.package:
+        name:
+          - epel-release
+          - dnf-plugins-core
+        state: present
+
+    - name: Enable CRB repository (Rocky 9)
+      ansible.builtin.command: dnf config-manager --set-enabled crb
+      changed_when: false
+      failed_when: false
+
+  tasks:
+    - name: Install node exporter (try multiple names)
+      block:
+        - ansible.builtin.package:
+            name: prometheus2-node-exporter
+            state: present
+      rescue:
+        - block:
+            - ansible.builtin.package:
+                name: prometheus-node-exporter
+                state: present
+          rescue:
+            - ansible.builtin.package:
+                name: node_exporter
+                state: present
+
+    - name: Ensure node_exporter service enabled
+      ansible.builtin.service:
+        name: node_exporter
+        state: started
+        enabled: yes
+      failed_when: false
+
+- hosts: mon
+  become: true
+  vars:
+    prom_dir: /etc/prometheus
+    prom_data: /var/lib/prometheus
+    am_dir: /etc/alertmanager
+    am_data: /var/lib/alertmanager
+
+  tasks:
+    - name: Install Podman
+      ansible.builtin.package:
+        name: podman
+        state: present
+
+    - name: Create config/data directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ prom_dir }}"
+        - "{{ prom_data }}"
+        - "{{ am_dir }}"
+        - "{{ am_data }}"
+
+    - name: Render Prometheus config
+      ansible.builtin.template:
+        src: templates/prometheus.yml.j2
+        dest: "{{ prom_dir }}/prometheus.yml"
+        mode: "0644"
+
+    - name: Ensure Prometheus data dir owned by container user
+      ansible.builtin.file:
+        path: "{{ prom_data }}"
+        state: directory
+        owner: nobody
+        group: nobody
+        mode: "0755"
+        recurse: yes
+
+    - name: (SELinux) relabel data dir just in case
+      ansible.builtin.command: restorecon -Rv {{ prom_data }}
+      changed_when: false
+      failed_when: false
+
+    - name: Render Alertmanager config (minimal)
+      ansible.builtin.copy:
+        dest: "{{ am_dir }}/alertmanager.yml"
+        mode: "0644"
+        content: |
+          route:
+            receiver: 'devnull'
+          receivers:
+            - name: 'devnull'
+
+    - name: Systemd unit - Prometheus (Podman)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/prometheus.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Prometheus (Podman)
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Restart=always
+          ExecStartPre=-/usr/bin/podman rm -f prometheus
+          ExecStart=/usr/bin/podman run --rm --name prometheus --net=host \
+            -v {{ prom_dir }}:/etc/prometheus:Z \
+            -v {{ prom_data }}:/prometheus:Z \
+            quay.io/prometheus/prometheus:latest \
+            --config.file=/etc/prometheus/prometheus.yml \
+            --storage.tsdb.path=/prometheus
+          ExecStop=/usr/bin/podman stop prometheus
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Systemd unit - Alertmanager (Podman)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/alertmanager.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Alertmanager (Podman)
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Restart=always
+          ExecStartPre=-/usr/bin/podman rm -f alertmanager
+          ExecStart=/usr/bin/podman run --rm --name alertmanager --net=host \
+            -v {{ am_dir }}:/etc/alertmanager:Z \
+            -v {{ am_data }}:/alertmanager:Z \
+            quay.io/prometheus/alertmanager:latest \
+            --config.file=/etc/alertmanager/alertmanager.yml \
+            --storage.path=/alertmanager
+          ExecStop=/usr/bin/podman stop alertmanager
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: Enable and start Prometheus
+      ansible.builtin.service:
+        name: prometheus
+        state: started
+        enabled: yes
+
+    - name: Enable and start Alertmanager
+      ansible.builtin.service:
+        name: alertmanager
+        state: started
+        enabled: yes

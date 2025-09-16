@@ -1,0 +1,22 @@
+{% raw %}
+groups:
+- name: infra.alerts
+  rules:
+  - alert: InstanceDown
+    expr: up == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Instance down ({{ $labels.instance }})"
+      description: "{{ $labels.job }} on {{ $labels.instance }} is not reachable"
+
+  - alert: HighCPU
+    expr: 100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High CPU on {{ $labels.instance }}"
+      description: "CPU usage > 85% for 5m"
+{% endraw %}

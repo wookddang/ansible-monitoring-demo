@@ -1,0 +1,25 @@
+# Ansible
+*.retry
+*.log
+.cache/
+facts/
+collections/
+roles/*/files/*
+host_vars/
+group_vars/
+# 실제 인벤토리는 민감하니 제외, 예시는 커밋
+inventory
+inventories/*/hosts
+inventories/*/hosts.ini
+
+# Python/venv
+__pycache__/
+.venv/
+venv/
+*.pyc
+
+# SSH & 기타 민감
+.ssh/
+*.pem
+*.key
+id_ed25519*

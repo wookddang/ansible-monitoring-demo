@@ -1,0 +1,91 @@
+- hosts: all
+  become: true
+
+  pre_tasks:
+    - name: Enable EPEL & dnf plugins
+      package:
+        name:
+          - epel-release
+          - dnf-plugins-core
+        state: present
+
+    - name: Enable CRB repository (Rocky 9)
+      command: dnf config-manager --set-enabled crb
+      changed_when: false
+      failed_when: false
+
+  vars:
+    fw_ports: [ '22/tcp','80/tcp','443/tcp','9100/tcp','9090/tcp','9093/tcp','3000/tcp' ]
+
+  tasks:
+    - name: Base packages
+      package:
+        name:
+          - chrony
+          - firewalld
+          - fail2ban
+          - policycoreutils-python-utils
+        state: present
+
+    - name: Start/enable services
+      service:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop: [ chronyd, firewalld ]
+
+    - name: SSH baseline (key only / root는 비번 금지)
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        backrefs: yes
+      loop:
+        - { regexp: '^#?PubkeyAuthentication\\s+.*',   line: 'PubkeyAuthentication yes' }
+        - { regexp: '^#?PasswordAuthentication\\s+.*', line: 'PasswordAuthentication no' }
+        - { regexp: '^#?PermitRootLogin\\s+.*',        line: 'PermitRootLogin prohibit-password' }
+        - { regexp: '^#?AuthorizedKeysFile\\s+.*',     line: 'AuthorizedKeysFile .ssh/authorized_keys' }
+      notify: Restart sshd
+
+    - name: Ensure sftp Subsystem
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?Subsystem\\s+sftp\\b'
+        line: 'Subsystem sftp /usr/libexec/openssh/sftp-server'
+        insertafter: EOF
+      notify: Restart sshd
+
+    - name: AllowUsers (deployer, root)
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^AllowUsers\\s+'
+        line: 'AllowUsers deployer root'
+        insertafter: EOF
+      notify: Restart sshd
+
+    - name: Open firewall ports (permanent+immediate)
+      firewalld:
+        port: "{{ item }}"
+        permanent: yes
+        immediate: yes
+        state: enabled
+      loop: "{{ fw_ports }}"
+
+    - name: Fail2ban jail for sshd
+      copy:
+        dest: /etc/fail2ban/jail.d/sshd.local
+        content: |
+          [sshd]
+          enabled = true
+          port    = ssh
+          filter  = sshd
+          logpath = %(sshd_log)s
+          maxretry = 5
+          bantime  = 15m
+      notify: Restart fail2ban
+
+  handlers:
+    - name: Restart sshd
+      service: { name: sshd, state: restarted }
+    - name: Restart fail2ban
+      service: { name: fail2ban, state: restarted, enabled: yes }

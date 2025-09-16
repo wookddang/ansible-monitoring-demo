@@ -1,0 +1,10 @@
+---
+- hosts : all
+  tasks:
+    - name : Restart SSHD
+      ansible.builtin.service:
+        name : sshd
+        state : restarted
+    - name : Print Message
+      debug :
+        msg : Hello
